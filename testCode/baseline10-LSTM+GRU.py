@@ -18,7 +18,7 @@ data.set_index("DATE", inplace=True)
 
 # 2. 数据划分
 PRED_STEP_LEN = 60
-sd = "2023-09-15"
+sd = "2023-10-15"
 sdd = (pd.to_datetime(sd) + timedelta(days=1)).strftime("%Y-%m-%d")
 ed = (pd.to_datetime(sd) + timedelta(days=PRED_STEP_LEN)).strftime("%Y-%m-%d")
 train_data = data[:sd]
@@ -39,7 +39,7 @@ def create_sequences(data, time_steps):
     return np.array(X), np.array(y)
 
 
-time_steps = 30
+time_steps = 7
 X_train, y_train = create_sequences(scaled_train_data, time_steps)
 X_test, y_test = create_sequences(scaled_test_data, time_steps)
 
@@ -55,22 +55,22 @@ print(X_test.shape, y_test.shape)
 
 
 # 5. 构建LSTM模型
-def build_lstm_model():
+def build_lstm_model(loss="mean_absolute_error"):
     model = Sequential()
     model.add(LSTM(128, return_sequences=True, input_shape=(time_steps, 1)))
     model.add(LSTM(64))
     model.add(Dense(1))
-    model.compile(optimizer=Adam(learning_rate=0.001), loss="mean_absolute_error")
+    model.compile(optimizer=Adam(learning_rate=0.001), loss=loss)
     return model
 
 
 # 6. 构建GRU模型
-def build_gru_model():
+def build_gru_model(loss="mean_absolute_error"):
     model = Sequential()
     model.add(GRU(128, return_sequences=True, input_shape=(time_steps, 1)))
     model.add(GRU(64))
     model.add(Dense(1))
-    model.compile(optimizer=Adam(learning_rate=0.001), loss="mean_absolute_error")
+    model.compile(optimizer=Adam(learning_rate=0.001), loss=loss)
     return model
 
 
@@ -85,8 +85,36 @@ lstm_model.fit(
     verbose=1,
 )
 
-lstm_predictions = lstm_model.predict(X_test)
-lstm_predictions = scaler.inverse_transform(lstm_predictions)  # 反标准化
+lstm_predictions1 = lstm_model.predict(X_test)
+lstm_predictions1 = scaler.inverse_transform(lstm_predictions1)  # 反标准化
+
+# 7.1 以不同loss函数训练LSTM模型
+lstm_model = build_lstm_model("mean_squared_error")
+lstm_model.fit(
+    X_train,
+    y_train,
+    epochs=20,
+    batch_size=32,
+    validation_data=(X_test, y_test),
+    verbose=1,
+)
+
+lstm_predictions2 = lstm_model.predict(X_test)
+lstm_predictions2 = scaler.inverse_transform(lstm_predictions2)  # 反标准化
+
+# 7.2 以不同loss函数训练LSTM模型
+lstm_model = build_lstm_model("mean_absolute_percentage_error")
+lstm_model.fit(
+    X_train,
+    y_train,
+    epochs=20,
+    batch_size=32,
+    validation_data=(X_test, y_test),
+    verbose=1,
+)
+
+lstm_predictions3 = lstm_model.predict(X_test)
+lstm_predictions3 = scaler.inverse_transform(lstm_predictions3)  # 反标准化
 
 # 8. 训练和预测GRU模型
 gru_model = build_gru_model()
@@ -111,15 +139,15 @@ def evaluate_model(y_true, y_pred, model_name):
     print(f"{model_name} - MSE: {mse:.2f}, RMSE: {rmse:.2f}, MAE: {mae:.2f}")
 
 
-print("===lstm_predictions:")
-print(lstm_predictions)
-print("===test_data[time_steps:]:")
-print(test_data[time_steps:])
-print("y_test:")
-print(y_test)
+# print("===lstm_predictions:")
+# print(lstm_predictions1)
+# print("===test_data[time_steps:]:")
+# print(test_data[time_steps:])
+# print("y_test:")
+# print(y_test)
 
 
-evaluate_model(test_data[time_steps:], lstm_predictions, "LSTM")
+evaluate_model(test_data[time_steps:], lstm_predictions1, "LSTM")
 evaluate_model(test_data[time_steps:], gru_predictions, "GRU")
 
 # 10. 可视化结果
@@ -132,9 +160,23 @@ plt.plot(
 )
 plt.plot(
     test_data.index[time_steps:],
-    lstm_predictions,
-    label="LSTM Predictions",
+    lstm_predictions1,
+    label="LSTM Predictions1",
     color="red",
+    linestyle="--",
+)
+plt.plot(
+    test_data.index[time_steps:],
+    lstm_predictions2,
+    label="LSTM Predictions2",
+    color="gray",
+    linestyle="--",
+)
+plt.plot(
+    test_data.index[time_steps:],
+    lstm_predictions3,
+    label="LSTM Predictions3",
+    color="orange",
     linestyle="--",
 )
 plt.plot(
