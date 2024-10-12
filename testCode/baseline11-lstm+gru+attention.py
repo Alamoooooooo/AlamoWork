@@ -66,15 +66,16 @@ class Attention(Layer):
             shape=(input_shape[-1],), initializer="zeros", trainable=True
         )
         self.u = self.add_weight(
-            shape=(input_shape[-1],), initializer="glorot_uniform", trainable=True
+            shape=(input_shape[-1], 1), initializer="glorot_uniform", trainable=True
         )
         super(Attention, self).build(input_shape)
 
     def call(self, x):
         # 计算注意力得分
         uit = K.tanh(K.dot(x, self.W) + self.b)  # [batch_size, time_steps, features]
-        ait = K.dot(uit, self.u)  # [batch_size, time_steps]
-        ait = K.softmax(ait, axis=1)  # [batch_size, time_steps]
+        ait = K.dot(uit, self.u)  # [batch_size, time_steps, 1]
+        ait = K.squeeze(ait, -1)  # 将最后一个维度降维，变为 [batch_size, time_steps]
+        ait = K.softmax(ait, axis=1)  # 归一化为权重 [batch_size, time_steps]
         ait = K.expand_dims(ait)  # [batch_size, time_steps, 1]
         weighted_input = x * ait  # 加权输入 [batch_size, time_steps, features]
         return K.sum(weighted_input, axis=1)  # 输出 [batch_size, features]
