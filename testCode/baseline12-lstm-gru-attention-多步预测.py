@@ -25,7 +25,7 @@ PREDICTION_LENGTH = 45  # 预测未来的步数
 time_steps = 7  # 增加输入的时间步长度，让模型参考更多的历史数据
 
 # 2. 数据划分
-sd = "2023-07-15"
+sd = "2023-08-15"
 sdd = (pd.to_datetime(sd) + timedelta(days=1)).strftime("%Y-%m-%d")
 ed = (pd.to_datetime(sd) + timedelta(days=PRED_STEP_LEN)).strftime("%Y-%m-%d")
 train_data = data[:sd]
@@ -107,14 +107,25 @@ def build_lstm_attention_model(time_steps, prediction_length):
     return model
 
 
+from tensorflow.keras.callbacks import EarlyStopping
+
+# 定义EarlyStopping回调
+early_stopping = EarlyStopping(
+    monitor="val_loss",  # 监控验证集损失
+    patience=60,  # 如果60个epoch没有改善，则停止训练
+    min_delta=0.0001,  # 改善的最小变化
+    restore_best_weights=True,  # 恢复到验证集表现最好的权重
+)
+
 # 7. 训练和评估LSTM + Attention模型
 lstm_attention_model = build_lstm_attention_model(time_steps, PREDICTION_LENGTH)
 lstm_attention_model.fit(
     X_train,
     y_train,
-    epochs=100,
+    epochs=200,
     batch_size=32,
     validation_data=(X_test, y_test),
+    callbacks=[early_stopping],  # 添加EarlyStopping回调
     verbose=1,
 )
 
@@ -141,9 +152,10 @@ gru_attention_model = build_gru_attention_model(time_steps, PREDICTION_LENGTH)
 gru_attention_model.fit(
     X_train,
     y_train,
-    epochs=100,
+    epochs=200,
     batch_size=32,
     validation_data=(X_test, y_test),
+    callbacks=[early_stopping],  # 添加EarlyStopping回调
     verbose=1,
 )
 
@@ -151,19 +163,22 @@ gru_attention_predictions = gru_attention_model.predict(X_test)
 gru_attention_predictions = scaler.inverse_transform(gru_attention_predictions)
 
 # 9. 可视化LSTM + Attention的多步预测结果
+# 6. 正确对齐的多步预测可视化
 plt.figure(figsize=(12, 6))
 
 # 多步预测的每个时间步的预测值需要正确对齐
 for i in range(PREDICTION_LENGTH):
+    # 每一步预测应该对应从 i+time_steps 开始的时间
     plt.plot(
         test_data.index[
             time_steps + i : len(lstm_attention_predictions) + time_steps + i
         ],
         lstm_attention_predictions[:, i],
-        label=f"LSTM + Attention Prediction (step {i+1})",
+        label=f"LSTM Prediction (step {i+1})",
         linestyle="--",
     )
 
+# 绘制真实值
 plt.plot(
     test_data.index[time_steps:],
     test_data["bal"][time_steps:],
@@ -171,7 +186,7 @@ plt.plot(
     color="blue",
 )
 
-plt.title("True Values vs LSTM with Attention Multi-Step Predictions")
+plt.title("True Values vs LSTM Multi-Step Predictions")
 plt.xlabel("Date")
 plt.ylabel("Value")
 plt.legend()
@@ -189,7 +204,7 @@ for i in range(PREDICTION_LENGTH):
             time_steps + i : len(lstm_attention_predictions) + time_steps + i
         ],
         lstm_attention_predictions[:, i],
-        label=f"LSTM + Attention Prediction (step {i+1})",
+        label=f"GRU + Attention Prediction (step {i+1})",
         linestyle="--",
     )
 
@@ -200,7 +215,7 @@ plt.plot(
     color="blue",
 )
 
-plt.title("True Values vs LSTM with Attention Multi-Step Predictions")
+plt.title("True Values vs GRU with Attention Multi-Step Predictions")
 plt.xlabel("Date")
 plt.ylabel("Value")
 plt.legend()
@@ -358,11 +373,6 @@ from matplotlib.animation import FuncAnimation
 
 # 假设你已经有了 lstm_attention_predictions 和 test_data 等数据
 
-# 创建时间步对齐的索引数组
-aligned_indices = test_data.index[
-    time_steps : len(lstm_attention_predictions) + time_steps
-]
-
 # 设置动画
 fig, ax = plt.subplots(figsize=(12, 6))
 
@@ -388,9 +398,14 @@ def update(step):
     ax.clear()  # 清空当前图像
     init()  # 重新绘制真实值
 
+    # 计算当前预测线应该对齐的时间步位置
+    start_index = time_steps + step  # 计算当前步的起始位置
+
     # 只绘制当前时间步的预测结果，不叠加之前的
     ax.plot(
-        aligned_indices,  # 恢复时间步对齐
+        test_data.index[
+            start_index : start_index + len(lstm_attention_predictions)
+        ],  # 动态调整起始位置
         lstm_attention_predictions[:, step],  # 当前时间步的预测值
         linestyle="--",
         label=f"Prediction (step {step+1})",
