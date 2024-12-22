@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-import holidays
+import timly_baselines.holidays as holidays
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.statespace.sarimax import SARIMAX

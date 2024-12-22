@@ -1,4 +1,4 @@
-import holidays
+import timly_baselines.holidays as holidays
 
 import locale
 
