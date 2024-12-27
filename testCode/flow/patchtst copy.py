@@ -4,6 +4,37 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+# 数据集定义
+class TimeSeriesDataset(Dataset):
+    def __init__(self, data, group_col, window_size, forecast_horizon):
+        self.data = data
+        self.group_col = group_col
+        self.window_size = window_size
+        self.forecast_horizon = forecast_horizon
+        self.samples = []
+
+        # 按组进行处理
+        grouped = self.data.groupby(self.group_col)
+        for group, group_data in grouped:
+            # 保证足够的数据长度
+            if len(group_data) >= (self.window_size + self.forecast_horizon):
+                # 获取该组的最后一个时间点作为预测起点
+                start_idx = len(group_data) - (self.window_size + self.forecast_horizon)
+                end_idx = start_idx + self.window_size
+
+                # 输入: window_size 时间步，输出: 未来 forecast_horizon 时间步
+                x = group_data.iloc[start_idx:end_idx][['in', 'out']].values
+                y = group_data.iloc[end_idx:end_idx + self.forecast_horizon][['in', 'out']].values
+                clus = group_data.iloc[start_idx:end_idx]['clus'].values[0]  # 保留该组的 'clus'
+
+                self.samples.append((x, y, clus))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        x, y, clus = self.samples[idx]
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32), clus
 
 # ===== Step 1: Load Data =====
 # 假设你有一个CSV文件: fund_flow_simulated.csv，包含 [date, clus, in, out]
@@ -40,51 +71,21 @@ print(f"Validation set starts on: {val_data['date'].min()}")
 print("Validation set starts on:", val_data["date"].min())
 
 
-# 为训练集和验证集分别构建DataLoader
-class TimeSeriesDataset(Dataset):
-    def __init__(self, data, window_size, forecast_horizon):
-        self.data = data
-        self.window_size = window_size
-        self.forecast_horizon = forecast_horizon
-
-    def __len__(self):
-        return len(self.data) - self.window_size - self.forecast_horizon
-
-    def __getitem__(self, idx):
-        x = self.data[idx : idx + self.window_size].values
-        y = self.data[
-            idx + self.window_size : idx + self.window_size + self.forecast_horizon
-        ].values
-
-        # 调试打印数据类型
-        assert np.issubdtype(
-            x.dtype, np.number
-        ), f"Data contains non-numeric values: {x}"
-        assert np.issubdtype(
-            y.dtype, np.number
-        ), f"Data contains non-numeric values: {y}"
-
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(
-            y, dtype=torch.float32
-        )
-
 
 # 检查并转换数据类型
-train_data[["in", "out"]] = train_data[["in", "out"]].apply(
-    pd.to_numeric, errors="coerce"
-)
-val_data[["in", "out"]] = val_data[["in", "out"]].apply(pd.to_numeric, errors="coerce")
+train_data.loc[:, ["in", "out"]] = train_data[["in", "out"]].apply(pd.to_numeric, errors="coerce")
+val_data.loc[:, ["in", "out"]] = val_data[["in", "out"]].apply(pd.to_numeric, errors="coerce")
 
 # 填充缺失值（根据业务需求选择合适的方法，例如用均值填充）
 train_data = train_data.fillna(0)
 val_data = val_data.fillna(0)
 
 # 确保数据为数值类型
-print(train_data[["in", "out"]].dtypes)
-print(val_data[["in", "out"]].dtypes)
+print(train_data[["in", "out", "clus"]].dtypes)
+print(val_data[["in", "out", "clus"]].dtypes)
 
-print(train_data[["in", "out"]].head())  # 查看前几行
-print(train_data[["in", "out"]].dtypes)  # 检查数据类型
+print(train_data[["in", "out", "clus"]].head())  # 查看前几行
+print(train_data[["in", "out", "clus"]].dtypes)  # 检查数据类型
 
 # 检查是否有缺失值
 print(train_data.isnull().sum())
@@ -92,19 +93,20 @@ print(val_data.isnull().sum())
 
 
 # 创建 DataLoader
-train_dataset = TimeSeriesDataset(
-    train_data[["in", "out"]],
-    window_size=window_size,
-    forecast_horizon=forecast_horizon,
-)
-val_dataset = TimeSeriesDataset(
-    val_data[["in", "out"]], window_size=window_size, forecast_horizon=forecast_horizon
-)
+train_dataset = TimeSeriesDataset(train_data, group_col="clus", window_size=window_size, forecast_horizon=forecast_horizon)
+val_dataset = TimeSeriesDataset(val_data, group_col="clus", window_size=window_size, forecast_horizon=forecast_horizon)
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-for x_batch, y_batch in train_loader:
+# 查看结果
+for idx, (x, y, clus) in enumerate(train_loader):
+    print(f"Sample {idx}:")
+    print("Input (x):", x)
+    print("Target (y):", y)
+    print("clus:", clus)
+
+for x_batch, y_batch, clus in train_loader:
     print(f"x_batch shape: {x_batch.shape}")  # [batch_size, window_size, input_dim]
     print(
         f"y_batch shape: {y_batch.shape}"
@@ -140,10 +142,10 @@ class PatchTST(nn.Module):
         self.fc = nn.Linear(128, output_dim)  # output_dim = 2, 即预测'in'和'out'
 
     def forward(self, x):
-        print(
-            f"Input to model: {x.shape}"
-        )  # Expected: [batch_size, window_size, input_dim]
-
+        # print(
+        #     f"Input to model: {x.shape}"
+        # )  # Expected: [batch_size, window_size, input_dim]
+        x = x.to(torch.float32)  # 确保输入是 float32 类型
         B, T, D = x.shape  # B = batch_size, T = sequence_length, D = input_dim
 
         x = x.unfold(1, self.patch_size, self.patch_size).permute(
@@ -193,7 +195,9 @@ scheduler = ReduceLROnPlateau(optimizer, "min", patience=3, verbose=True)
 for epoch in range(epochs):
     model.train()
     epoch_loss = 0.0
-    for x_batch, y_batch in train_loader:
+    for x_batch, y_batch, clus in train_loader:
+        x_batch = x_batch.to(torch.float32)
+        y_batch = y_batch.to(torch.float32)
         optimizer.zero_grad()
         predictions = model(x_batch)
         loss = criterion(predictions, y_batch)
@@ -206,6 +210,8 @@ for epoch in range(epochs):
     val_loss = 0.0
     with torch.no_grad():
         for x_batch, y_batch in val_loader:
+            x_batch = x_batch.to(torch.float32)
+            y_batch = y_batch.to(torch.float32)
             predictions = model(x_batch)
             loss = criterion(predictions, y_batch)
             val_loss += loss.item()
@@ -218,36 +224,50 @@ for epoch in range(epochs):
 # ===== Step 5: Prediction =====
 # 获取验证集上的预测结果
 model.eval()
+
 val_predictions = []
 val_actuals = []
+val_clusts = []  # 用于存储分组信息
 with torch.no_grad():
-    for x_batch, y_batch in val_loader:
+    for x_batch, y_batch, clus_batch in val_loader:  # 注意这里也返回了 clus
         pred = model(x_batch)
-        val_predictions.append(pred.numpy())
-        val_actuals.append(y_batch.numpy())
+        val_predictions.append(pred.numpy())  # 添加预测结果
+        val_actuals.append(y_batch.numpy())  # 添加真实值
+        val_clusts.append(clus_batch.numpy())  # 添加分组信息
 
-# 将预测结果转换成DataFrame，并与真实结果对比
-val_predictions = np.concatenate(val_predictions, axis=0)  # (77, 14, 2)
-val_actuals = np.concatenate(val_actuals, axis=0)  # (77, 14, 2)
+# 将预测结果、真实值和分组信息转换为 NumPy 数组
+val_predictions = np.concatenate(val_predictions, axis=0)
+val_actuals = np.concatenate(val_actuals, axis=0)
+val_clusts = np.concatenate(val_clusts, axis=0)
 
-# 方法 1: 展平时间步
-val_predictions = val_predictions.reshape(val_predictions.shape[0], -1)
+# 展平预测结果、真实值，并保留分组信息
+val_predictions = val_predictions.reshape(val_predictions.shape[0], -1)  # 展平预测值
+val_actuals = val_actuals.reshape(val_actuals.shape[0], -1)  # 展平真实值
+
+# 创建 DataFrame，包含预测值
 val_df = pd.DataFrame(
     val_predictions,
     columns=[f"{col}_{i}" for i in range(14) for col in ["in", "out"]],
 )
 
-# 或者使用方法 2: 长表格形式
-# time_steps = val_predictions.shape[1]
-# val_df = pd.DataFrame({
-#     "step": np.tile(np.arange(time_steps), val_predictions.shape[0]),
-#     "in": val_predictions[:, :, 0].flatten(),
-#     "out": val_predictions[:, :, 1].flatten(),
-#     "actual_in": np.repeat(val_actuals[:, :, 0], time_steps),
-#     "actual_out": np.repeat(val_actuals[:, :, 1], time_steps),
-# })
+# 创建 DataFrame，包含真实值
+actual_df = pd.DataFrame(
+    val_actuals,
+    columns=[f"actual_{col}_{i}" for i in range(14) for col in ["in", "out"]],
+)
 
+# 创建 DataFrame，包含分组信息
+clus_df = pd.DataFrame(
+    val_clusts,  # 现在是一个一维数组
+    columns=["clus"]
+)
+
+# 合并预测值、真实值和分组信息
+val_df = pd.concat([clus_df, val_df, actual_df], axis=1)
+
+# 打印对比数据
 print(val_df)
+
 
 
 # ===== Step 6: Make Future Predictions =====
@@ -255,14 +275,14 @@ print(val_df)
 model.eval()
 future_predictions = []
 group_keys = []  # 用于存储分组键
-
+print(groups)
 for clus, group in groups:
     group_keys.append(clus)  # 存储分组键
 
     # 修复：仅选择数值列传递给 TimeSeriesDataset
-    group_data = group[["in", "out"]]  # 去掉 'date' 列，只保留数值列
+    group_data = group[["in", "out", "clus"]]  # 去掉 'date' 列，只保留数值列
     group_dataset = TimeSeriesDataset(
-        group_data, window_size=window_size, forecast_horizon=forecast_horizon
+        group_data, group_col="clus", window_size=window_size, forecast_horizon=forecast_horizon
     )
     group_loader = DataLoader(group_dataset, batch_size=1, shuffle=False)
 
@@ -335,6 +355,41 @@ print(future_df)
 # 
 # print(future_df)
 
+import matplotlib.pyplot as plt
+
+# 获取需要绘制的组
+group_data = val_df[val_df["clus"] == "clus"]
+
+# 获取前14天的预测数据
+first_14_days = group_data["date"].unique()[:14]
+plot_data = group_data[group_data["date"].isin(first_14_days)]
+
+# 可视化：同时绘制真实值与预测值
+plt.figure(figsize=(14, 8))
+
+# 分别绘制 'in' 和 'out' 的预测与真实值
+for var in ["in", "out"]:
+    for date in first_14_days:
+        # 真实值
+        daily_data_actual = plot_data[plot_data["date"] == date][f"actual_{var}"]
+        # 预测值
+        daily_data_pred = plot_data[plot_data["date"] == date][var]
+
+        # 绘制图形
+        plt.plot(plot_data["time_step"], daily_data_actual, label=f"Actual {var} - {date}", linestyle="--", color="red")
+        plt.plot(plot_data["time_step"], daily_data_pred, label=f"Predicted {var} - {date}", linestyle="-", color="blue")
+
+# 图表设置
+plt.title(f"14-Day Prediction vs Actuals for Group {group_id_to_plot}", fontsize=16)
+plt.xlabel("Time Step", fontsize=14)
+plt.ylabel("Values", fontsize=14)
+plt.legend(loc="upper left", bbox_to_anchor=(1.05, 1), fontsize=10)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================
 
 import matplotlib.pyplot as plt
 
@@ -363,3 +418,6 @@ plt.legend(loc="upper left", bbox_to_anchor=(1.05, 1), fontsize=10)
 plt.grid(True)
 plt.tight_layout()
 plt.show()
+
+
+
