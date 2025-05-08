@@ -1,0 +1,168 @@
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+
+import random
+import datetime
+import os
+from PyQt5.QtWidgets import QApplication, QLabel, QMenu, QAction
+from PyQt5.QtGui import QMovie
+from PyQt5.QtCore import Qt, QTimer, QPoint
+from pygame import mixer
+
+class DesktopPet(QLabel):
+    def __init__(self):
+        super().__init__()
+        self.is_fixed = False  # 是否固定
+        self.skins = self.load_skins()  # 加载皮肤
+        self.current_skin = "default"  # 初始化默认皮肤
+        self.dx, self.dy = 1, 1  # 每次移动的速度（像素）
+        self.init_ui()  # 初始化界面
+
+        # 定时器，用于更新位置
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_position)
+        self.timer.start(16)  # 每16毫秒更新一次，相当于60帧/秒
+        self.setMouseTracking(True)  # 开启鼠标追踪
+
+    def init_ui(self):
+        # 设置桌宠初始位置
+        self.setGeometry(100, 100, 128, 128)
+
+        # 将桌宠显示在屏幕中央
+        screen = QApplication.primaryScreen().geometry()
+        x = (screen.width() - self.width()) // 2
+        y = (screen.height() - self.height()) // 2
+        self.move(x, y)
+        print(f"桌宠启动位置：x={x}, y={y}")
+
+        # 设置透明窗口
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.SubWindow)
+        # self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        # 初始化声音
+        mixer.init()
+        self.click_sound = "click.mp3"  # 替换为你的声音文件路径
+
+        # 动态 gif 初始化
+        self.movie = QMovie(self.get_skin_path(self.current_skin))
+        self.setMovie(self.movie)
+        self.movie.start()
+
+        # 右键菜单
+        self.menu = QMenu(self)
+        self.create_menu()
+
+        self.resize(128, 128)  # 桌宠初始大小
+
+        # 检查节日动态
+        self.check_festival()
+
+
+    def update_position(self):
+        if not self.is_fixed:  # 如果桌宠未被固定
+            current_x = self.x()
+            current_y = self.y()
+
+            # 移动位置
+            new_x = current_x + self.dx
+            new_y = current_y + self.dy
+
+            # 获取屏幕尺寸，防止超出边界
+            screen = QApplication.primaryScreen().geometry()
+            if new_x <= 0 or new_x + self.width() >= screen.width():
+                self.dx = -self.dx  # 碰到左右边界，反向
+            if new_y <= 0 or new_y + self.height() >= screen.height():
+                self.dy = -self.dy  # 碰到上下边界，反向
+
+            # 移动桌宠
+            self.move(new_x, new_y)
+
+
+    def create_menu(self):
+        # 添加右键菜单选项
+        fix_action = QAction("固定/取消固定", self)
+        fix_action.triggered.connect(self.toggle_fixed)
+        self.menu.addAction(fix_action)
+
+        # 皮肤切换
+        skin_menu = QMenu("切换皮肤", self)
+        for skin in self.skins:
+            skin_action = QAction(skin, self)
+            skin_action.triggered.connect(lambda _, s=skin: self.change_skin(s))
+            skin_menu.addAction(skin_action)
+        self.menu.addMenu(skin_menu)
+
+        open_file_action = QAction("打开文件", self)
+        open_file_action.triggered.connect(self.open_file)
+        self.menu.addAction(open_file_action)
+
+        link_action = QAction("跳转链接", self)
+        link_action.triggered.connect(lambda: self.open_link("https://www.example.com"))
+        self.menu.addAction(link_action)
+
+        quit_action = QAction("退出", self)
+        quit_action.triggered.connect(self.close)
+        self.menu.addAction(quit_action)
+
+    def load_skins(self):
+        # 假设所有皮肤 gif 都放在 skins 文件夹中
+        skin_folder = "skins"
+        if not os.path.exists(skin_folder):
+            os.makedirs(skin_folder)  # 如果文件夹不存在，则创建
+        skins = [f.replace(".gif", "") for f in os.listdir(skin_folder) if f.endswith(".gif")]
+        if "default" not in skins:
+            # 添加一个默认皮肤
+            skins.insert(0, "default")
+        return skins
+
+    def get_skin_path(self, skin_name):
+        # 返回皮肤的完整路径
+        if skin_name == "default":
+            return "cat_idle.gif"  # 替换为默认皮肤的路径
+        return os.path.join("skins", f"{skin_name}.gif")
+
+    def toggle_fixed(self):
+        self.is_fixed = not self.is_fixed
+
+    def open_file(self):
+        # 打开一个文件，比如 README.txt
+        os.system("notepad README.txt")
+
+    def open_link(self, url):
+        import webbrowser
+        webbrowser.open(url)
+
+    def change_skin(self, skin_name):
+        self.current_skin = skin_name
+        self.movie.stop()
+        self.movie.setFileName(self.get_skin_path(skin_name))
+        self.movie.start()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.menu.exec_(event.globalPos())
+        elif event.button() == Qt.LeftButton:
+            self.old_pos = event.globalPos()
+            # 播放点击音效
+            if os.path.exists(self.click_sound):
+                mixer.Sound(self.click_sound).play()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton and not self.is_fixed:
+            delta = QPoint(event.globalPos() - self.old_pos)
+            self.move(self.x() + delta.x(), self.y() + delta.y())
+            self.old_pos = event.globalPos()
+
+    def check_festival(self):
+        # 检查是否为节日
+        today = datetime.datetime.now().date()
+        if today == datetime.date(today.year, 1, 1):  # 新年
+            self.change_skin("new_year")
+        elif today == datetime.date(today.year, 2, 10):  # 春节（假设日期）
+            self.change_skin("spring_festival")
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    pet = DesktopPet()
+    pet.show()
+    sys.exit(app.exec_())

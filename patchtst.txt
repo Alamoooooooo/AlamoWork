@@ -1,0 +1,403 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+
+# ===================== 简化的 Series Decomposition 模块 =====================
+class SeriesDecomp(nn.Module):
+    """
+    使用1D平均池化对输入做简单的趋势/残差分解
+    输入 shape: [B, T, C]，输出两个 tensor，均为 [B, T, C]
+    """
+    def __init__(self, kernel_size: int):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.padding = (kernel_size - 1) // 2
+        self.avg = nn.AvgPool1d(kernel_size, stride=1, padding=self.padding)
+
+    def forward(self, x: torch.Tensor):
+        # x: [B, T, C] -> [B, C, T]
+        x_permuted = x.permute(0, 2, 1)
+        trend = self.avg(x_permuted)
+        res = x_permuted - trend
+        # 还原回 [B, T, C]
+        trend = trend.permute(0, 2, 1)
+        res = res.permute(0, 2, 1)
+        return res, trend
+
+# ===================== 简化的 PatchTST Backbone 模块 =====================
+class PatchTSTBackbone(nn.Module):
+    """
+    一个简化版的 PatchTST backbone
+    使用1D卷积做patch embedding，再利用TransformerEncoder对patch序列建模，
+    最后输出固定长度（target_window）的特征表示。
+    输入：x，形状为 [B, C, T]
+    输出：x，形状为 [B, d_model, target_window]
+    """
+    def __init__(self, 
+                 c_in: int,
+                 context_window: int,
+                 target_window: int,
+                 patch_len: int,
+                 stride: int,
+                 max_seq_len: int,
+                 n_layers: int,
+                 d_model: int,
+                 n_heads: int,
+                 d_ff: int,
+                 dropout: float,
+                 **kwargs):
+        super().__init__()
+        self.context_window = context_window
+        self.target_window = target_window
+        self.patch_len = patch_len
+        self.stride = stride
+
+        # patch embedding: 使用Conv1d将连续patch映射到d_model维度
+        self.patch_embedding = nn.Conv1d(in_channels=c_in, 
+                                         out_channels=d_model, 
+                                         kernel_size=patch_len, 
+                                         stride=stride)
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=n_heads, 
+            dim_feedforward=d_ff, 
+            dropout=dropout, 
+            batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # 线性变换
+        self.fc = nn.Linear(d_model, d_model)
+
+    def forward(self, x: torch.Tensor):
+        # x: [B, C, T]
+        x = self.patch_embedding(x)  # [B, d_model, L]
+        x = x.permute(0, 2, 1)       # [B, L, d_model]
+        x = self.transformer_encoder(x)  # [B, L, d_model]
+        # 截取或补齐至 target_window 长度
+        if x.size(1) >= self.target_window:
+            x = x[:, -self.target_window:, :]
+        else:
+            pad_len = self.target_window - x.size(1)
+            pad_tensor = torch.zeros(x.size(0), pad_len, x.size(2), device=x.device)
+            x = torch.cat([x, pad_tensor], dim=1)
+        x = self.fc(x)             # [B, target_window, d_model]
+        x = x.permute(0, 2, 1)       # [B, d_model, target_window]
+        return x
+
+# ===================== PatchTST 模型 =====================
+class PatchTSTModel(nn.Module):
+    def __init__(self, configs, max_seq_len: int = 1024, **kwargs):
+        """
+        构造模型，根据配置决定是否使用趋势/残差分解
+        输出层将 d_model 映射为2，分别对应“申购”和“赎回”
+        """
+        super().__init__()
+        c_in = configs.enc_in             # 输入变量个数（这里为2：in和out）
+        context_window = configs.seq_len   # 输入序列长度
+        target_window = configs.pred_len   # 预测步数
+        d_model = configs.d_model
+        n_layers = configs.e_layers
+        n_heads = configs.n_heads
+        d_ff = configs.d_ff
+        dropout = configs.dropout
+        patch_len = configs.patch_len
+        stride = configs.stride
+        decomposition = configs.decomposition
+        kernel_size = configs.kernel_size
+
+        self.decomposition = decomposition
+
+        if self.decomposition:
+            self.decomp_module = SeriesDecomp(kernel_size)
+            self.model_trend = PatchTSTBackbone(c_in=c_in,
+                              context_window=context_window,
+                              target_window=target_window,
+                              patch_len=patch_len,
+                              stride=stride,
+                              max_seq_len=max_seq_len,
+                              n_layers=n_layers,
+                              d_model=d_model,
+                              n_heads=n_heads,
+                              d_ff=d_ff,
+                              dropout=dropout)
+            self.model_res = PatchTSTBackbone(c_in=c_in,
+                              context_window=context_window,
+                              target_window=target_window,
+                              patch_len=patch_len,
+                              stride=stride,
+                              max_seq_len=max_seq_len,
+                              n_layers=n_layers,
+                              d_model=d_model,
+                              n_heads=n_heads,
+                              d_ff=d_ff,
+                              dropout=dropout)
+        else:
+            self.model = PatchTSTBackbone(c_in=c_in,
+                            context_window=context_window,
+                            target_window=target_window,
+                            patch_len=patch_len,
+                            stride=stride,
+                            max_seq_len=max_seq_len,
+                            n_layers=n_layers,
+                            d_model=d_model,
+                            n_heads=n_heads,
+                            d_ff=d_ff,
+                            dropout=dropout)
+        # 输出层：映射到2（申购、赎回）
+        self.linear = nn.Linear(d_model, 2)
+
+    def forward(self, x: torch.Tensor, emb_x=None):
+        # x: [B, seq_len, C]
+        if self.decomposition:
+            res_init, trend_init = self.decomp_module(x)  # [B, T, C]
+            res_init = res_init.permute(0, 2, 1)
+            trend_init = trend_init.permute(0, 2, 1)
+            res = self.model_res(res_init)
+            trend = self.model_trend(trend_init)
+            x = res + trend
+            x = x.permute(0, 2, 1)  # [B, target_window, d_model]
+        else:
+            x = x.permute(0, 2, 1)  # [B, C, T]
+            x = self.model(x)       # [B, d_model, target_window]
+            x = x.permute(0, 2, 1)  # [B, target_window, d_model]
+
+        output = self.linear(x)     # [B, target_window, 2]
+        return output
+
+# ===================== 配置类 =====================
+class Config:
+    def __init__(self):
+        self.enc_in = 2          # 输入变量个数：“in”和“out”
+        self.seq_len = 30        # 输入序列长度
+        self.pred_len = 14       # 预测未来14天
+        self.d_model = 64        # 模型特征维度
+        self.e_layers = 2        # Transformer层数
+        self.n_heads = 4         # 注意力头数
+        self.d_ff = 128          # FFN维度
+        self.dropout = 0.1
+        self.patch_len = 4       # patch长度
+        self.stride = 2          # patch步长
+        self.decomposition = True   # 是否使用分解
+        self.kernel_size = 25         # 分解模块kernel_size
+
+# ===================== 时间序列数据集 =====================
+class TimeSeriesDataset(Dataset):
+    """
+    构造滑动窗口样本，每个样本：
+       - x: 过去 seq_len 天数据, shape: [seq_len, 2]
+       - y: 未来 pred_len 天数据, shape: [pred_len, 2]
+    """
+    def __init__(self, series: np.ndarray, seq_len: int, pred_len: int):
+        self.series = series
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.n_samples = len(series) - seq_len - pred_len + 1
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        x = self.series[idx : idx + self.seq_len]
+        y = self.series[idx + self.seq_len : idx + self.seq_len + self.pred_len]
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+
+# ===================== 数据读取与预处理 =====================
+def load_data(csv_file: str, clus_filter: str = None):
+    """
+    读取 CSV 文件，转换日期格式、按日期排序，
+    返回 DataFrame、数值序列（仅in和out）以及日期列表
+    """
+    df = pd.read_csv(csv_file)
+    df['date'] = pd.to_datetime(df['date'])
+    if clus_filter is not None:
+        df = df[df['clus'] == clus_filter]
+    df = df.sort_values('date').reset_index(drop=True)
+    date_list = df['date'].tolist()
+    series = df[['in', 'out']].values
+    return df, series, date_list
+
+# ===================== 批量预测函数 =====================
+def predict_on_dates(model: nn.Module, series: np.ndarray, date_list: list, 
+                     target_dates: list, config: Config, device, scaler):
+    """
+    对多个测试起始日期执行预测
+    对于每个目标日期：
+      - 找到在 date_list 中的位置
+      - 利用该日期前 config.seq_len 天数据作为输入进行预测（预测未来 config.pred_len 天）
+      - 将预测结果和真实值（未来 config.pred_len 天）汇总到一个列表中
+    最后返回一个 DataFrame，包含：
+      - start_date: 预测起始日期（模型输入截止日期）
+      - pred_date: 预测的目标日期（起始日期之后）
+      - true_in, pred_in, true_out, pred_out, error_in, error_out
+    """
+    results = []
+    for t in target_dates:
+        target_dt = pd.to_datetime(t)
+        try:
+            idx = date_list.index(target_dt)
+        except ValueError:
+            print(f"指定日期 {t} 不在数据中，跳过该日期。")
+            continue
+        # 检查历史与未来数据是否充足
+        if idx < config.seq_len:
+            print(f"日期 {t} 前数据不足，跳过。")
+            continue
+        if idx + config.pred_len > len(series):
+            print(f"日期 {t} 后数据不足，跳过。")
+            continue
+
+        # 构造输入：取目标日期前 config.seq_len 天数据，并归一化
+        x_input = series[idx - config.seq_len: idx]  # [seq_len, 2]
+        x_input_scaled = scaler.transform(x_input)
+        x_input_tensor = torch.tensor(x_input_scaled, dtype=torch.float32).unsqueeze(0)  # [1, seq_len, 2]
+        
+        model.eval()
+        with torch.no_grad():
+            pred = model(x_input_tensor.to(device))  # [1, pred_len, 2]
+        pred = pred.squeeze(0).cpu().numpy()  # [pred_len, 2]
+        # 将预测结果逆归一化到原始尺度
+        pred_inverse = scaler.inverse_transform(pred)
+        
+        # 获取对应真实值：未来 config.pred_len 天数据
+        true_values = series[idx: idx + config.pred_len]  # [pred_len, 2]
+        # 构造预测日期列表：从目标日期的下一天开始
+        pred_dates = [target_dt + timedelta(days=i+1) for i in range(config.pred_len)]
+        
+        # 将每个预测步的数据存储到results列表中，同时记录当前预测起始日期
+        for p_date, true_val, pred_val in zip(pred_dates, true_values, pred_inverse):
+            results.append({
+                "start_date": target_dt.date(),
+                "pred_date": p_date.date(),
+                "true_in": true_val[0],
+                "pred_in": pred_val[0],
+                "true_out": true_val[1],
+                "pred_out": pred_val[1],
+                "error_in": pred_val[0] - true_val[0],
+                "error_out": pred_val[1] - true_val[1],
+            })
+    df_results = pd.DataFrame(results)
+    return df_results
+
+# ===================== 主流程 =====================
+def main():
+    # -------------------- 参数与设备配置 --------------------
+    config = Config()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # -------------------- 数据加载与归一化 --------------------
+    csv_file = "mock_data.csv"  # 修改为实际路径
+    df, series, date_list = load_data(csv_file, clus_filter=None)
+
+    # 划分训练集和测试集
+    # 假设将80%的数据作为训练集，后20%作为测试集
+    n_total = len(series)
+    n_train = int(n_total * 0.8)
+
+    # 注意这里的划分方式确保测试数据完全在训练数据之后
+    train_series = series[:n_train]
+    train_dates = date_list[:n_train]
+    test_series = series[n_train:]
+    test_dates = date_list[n_train:]
+
+    print("训练预测时间划分：", df.loc[n_train,'date'])
+
+    scaler = StandardScaler()
+    # 用归一化器拟合整个序列数据
+    train_series_scaled = scaler.fit_transform(train_series)
+    test_series_scaled = scaler.transform(test_series) # 用同一 scaler 转换测试集
+    
+    # 构造数据集（训练时使用归一化后的数据）
+    train_dataset = TimeSeriesDataset(train_series_scaled, seq_len=config.seq_len, pred_len=config.pred_len)
+    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+
+    # 测试数据集
+    test_dataset = TimeSeriesDataset(test_series_scaled, seq_len=config.seq_len, pred_len=config.pred_len)
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)  # 测试时通常不shuffle
+    
+    # -------------------- 模型构建与训练 --------------------
+    model = PatchTSTModel(config).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.MSELoss()
+
+    num_epochs = 100
+    model.train()
+    for epoch in range(num_epochs):
+        epoch_loss = 0.
+        for batch_x, batch_y in train_dataloader:
+            optimizer.zero_grad()
+            pred = model(batch_x.to(device))
+            loss = criterion(pred, batch_y.to(device))
+            loss.backward()
+            # 可选：使用梯度裁剪，例如 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            epoch_loss += loss.item() * batch_x.size(0)
+        epoch_loss /= len(train_dataset)
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.6f}")
+    
+    # -------------------- 批量预测测试 --------------------
+    # 定义一个测试日期集合（注意选择有足够历史数据和未来数据的日期）
+    test_target_dates = [
+        "2024-08-15",
+        "2024-08-20",
+        "2024-08-31",
+        "2024-09-05",
+        "2024-09-20",
+        "2024-10-15",
+        "2024-11-15",
+        "2024-12-15",
+    ]
+    
+    df_result = predict_on_dates(model, test_series, test_dates, test_target_dates, config, device, scaler)
+    
+    if df_result.empty:
+        print("没有有效的预测结果，请检查测试日期和数据范围。")
+        return
+    
+    print("\n预测结果 DataFrame:")
+    print(df_result)
+    
+    # 计算整体误差指标（对所有预测样本）
+    mse_in = mean_squared_error(df_result["true_in"], df_result["pred_in"])
+    mse_out = mean_squared_error(df_result["true_out"], df_result["pred_out"])
+    mae_in = mean_absolute_error(df_result["true_in"], df_result["pred_in"])
+    mae_out = mean_absolute_error(df_result["true_out"], df_result["pred_out"])
+    print(f"\n申购数据 -> MSE: {mse_in:.4f}, MAE: {mae_in:.4f}")
+    print(f"赎回数据 -> MSE: {mse_out:.4f}, MAE: {mae_out:.4f}")
+    
+    # -------------------- 可视化 --------------------
+    # 对于每个测试起始日期，分别绘制预测与真实值对比图
+    unique_start_dates = df_result["start_date"].unique()
+    n_plots = len(unique_start_dates)
+    fig, axs = plt.subplots(n_plots, 2, figsize=(12, 4 * n_plots), squeeze=False)
+    
+    for i, s_date in enumerate(unique_start_dates):
+        df_sub = df_result[df_result["start_date"] == s_date]
+        # 申购数据对比
+        axs[i, 0].plot(df_sub["pred_date"], df_sub["true_in"], marker="o", label="True In")
+        axs[i, 0].plot(df_sub["pred_date"], df_sub["pred_in"], marker="x", label="Predicted In")
+        axs[i, 0].set_title(f"申购预测 vs 真实值 (起始 {s_date})")
+        axs[i, 0].set_xlabel("日期")
+        axs[i, 0].legend()
+        axs[i, 0].tick_params(axis='x', rotation=45)
+        
+        # 赎回数据对比
+        axs[i, 1].plot(df_sub["pred_date"], df_sub["true_out"], marker="o", label="True Out")
+        axs[i, 1].plot(df_sub["pred_date"], df_sub["pred_out"], marker="x", label="Predicted Out")
+        axs[i, 1].set_title(f"赎回预测 vs 真实值 (起始 {s_date})")
+        axs[i, 1].set_xlabel("日期")
+        axs[i, 1].legend()
+        axs[i, 1].tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()

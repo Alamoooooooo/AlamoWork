@@ -1,0 +1,6 @@
+目前参数化配置还没有做的很好
+1 先跑preprocessing.ipynb 最后150天不训练用来验证
+2 然后跑train_purgedcv_ae_mlp.py 生成5个fold的模型文件以及记录每个模型train_Dates的best_score和best_epoch
+3 用同样的参数在最后训练集的train_dates训练一个相对于验证集（150天）的新模型，不使用早停策略，使用cv环节的best_epoch来停止训练
+4 inference.ipynb 在本地150天验证集上验证效果并调整 5+1个模型的权重
+5 将验证集合并到训练集里制作最新的5+1个模型。
